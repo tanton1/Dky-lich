@@ -93,17 +93,72 @@ export function generateSchedule(students: Student[], trainers: Trainer[]): Sche
 
     // Assign slots to trainers
     for (const slot of selectedSlots) {
+      const [day, hourStr] = slot.split('-');
+      const hour = parseInt(hourStr, 10);
+      const hourIndex = HOURS.indexOf(hour);
+
       const trainerCounts: Record<string, number> = {};
       for (const t of trainers) trainerCounts[t.id] = 0;
       for (const entry of schedule[slot]) {
         trainerCounts[entry.trainerId]++;
       }
       
-      const availableTrainer = trainers.find(t => trainerCounts[t.id] < MAX_STUDENTS_PER_PT);
-      if (availableTrainer) {
+      const availableTrainers = trainers.filter(t => trainerCounts[t.id] < MAX_STUDENTS_PER_PT);
+      
+      if (availableTrainers.length > 0) {
+        // Score trainers to prioritize contiguous shifts
+        const scoredTrainers = availableTrainers.map(trainer => {
+          let score = 0;
+          
+          // Priority 1: Trainer already has 1 student in this exact slot (fill up to 2)
+          if (trainerCounts[trainer.id] > 0) {
+            score += 1000;
+          }
+
+          let hasClassesToday = false;
+          
+          for (let i = 0; i < HOURS.length; i++) {
+            if (i === hourIndex) continue;
+            const h = HOURS[i];
+            const isTeaching = schedule[`${day}-${h}`]?.some(e => e.trainerId === trainer.id);
+            if (isTeaching) {
+              hasClassesToday = true;
+              const diff = Math.abs(i - hourIndex);
+              if (diff === 1) {
+                score += 100; // Adjacent shift (liền mạch)
+              } else if (diff === 2) {
+                score -= 50; // 1 shift gap (nghỉ 1 ca)
+              } else if (diff === 3) {
+                score -= 20; // 2 shift gap (nghỉ 2 ca)
+              } else {
+                score -= 5; // >2 shift gap
+              }
+            }
+          }
+
+          // Priority 4: Trainer has no other classes today (better than having a gap)
+          if (!hasClassesToday) {
+            score += 10; // Slightly prefer starting a new block over creating a gap
+          }
+
+          // Penalty for total classes assigned so far to balance workload
+          let totalClasses = 0;
+          for (const s in schedule) {
+            totalClasses += schedule[s].filter(e => e.trainerId === trainer.id).length;
+          }
+          score -= totalClasses * 0.1;
+
+          return { trainer, score };
+        });
+
+        // Sort by score descending
+        scoredTrainers.sort((a, b) => b.score - a.score);
+        
+        const bestTrainer = scoredTrainers[0].trainer;
+        
         schedule[slot].push({
           studentId: id,
-          trainerId: availableTrainer.id
+          trainerId: bestTrainer.id
         });
       }
     }

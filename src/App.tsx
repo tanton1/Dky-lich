@@ -6,6 +6,7 @@ import PTSchedule from './components/PTSchedule';
 import StudentList from './components/StudentList';
 import TrainerList from './components/TrainerList';
 import { CalendarDays, Users, UserPlus, Play, Activity, Dumbbell, RotateCcw, Trash2 } from 'lucide-react';
+import { supabase } from './supabase';
 
 export default function App() {
   const [students, setStudents] = useState<Student[]>([]);
@@ -16,42 +17,85 @@ export default function App() {
   const [editingStudent, setEditingStudent] = useState<Student | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load from API on mount
+  // Real-time sync from Supabase
   useEffect(() => {
-    fetch('/api/data')
-      .then(res => res.json())
-      .then(data => {
-        if (data.students) setStudents(data.students);
-        if (data.trainers) setTrainers(data.trainers);
-        if (data.schedule) setSchedule(data.schedule);
-        if (data.warnings) setWarnings(data.warnings);
+    // Initial fetch
+    const fetchData = async () => {
+      try {
+        const [studentsRes, trainersRes, stateRes] = await Promise.all([
+          supabase.from('students').select('*'),
+          supabase.from('trainers').select('*'),
+          supabase.from('app_state').select('*').eq('id', 'current').single()
+        ]);
+
+        if (studentsRes.data) setStudents(studentsRes.data as Student[]);
+        if (trainersRes.data) setTrainers(trainersRes.data as Trainer[]);
+        if (stateRes.data) {
+          if (stateRes.data.schedule) setSchedule(stateRes.data.schedule);
+          if (stateRes.data.warnings) setWarnings(stateRes.data.warnings);
+        }
+      } catch (error) {
+        console.error("Error fetching initial data:", error);
+      } finally {
         setIsLoading(false);
+      }
+    };
+
+    fetchData();
+
+    // Realtime subscriptions
+    const studentsSub = supabase.channel('public:students')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'students' }, (payload) => {
+        if (payload.eventType === 'INSERT') {
+          setStudents(prev => [...prev, payload.new as Student]);
+        } else if (payload.eventType === 'UPDATE') {
+          setStudents(prev => prev.map(s => s.id === payload.new.id ? payload.new as Student : s));
+        } else if (payload.eventType === 'DELETE') {
+          setStudents(prev => prev.filter(s => s.id !== payload.old.id));
+        }
       })
-      .catch(err => {
-        console.error('Failed to load data:', err);
-        setIsLoading(false);
-      });
+      .subscribe();
+
+    const trainersSub = supabase.channel('public:trainers')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'trainers' }, (payload) => {
+        if (payload.eventType === 'INSERT') {
+          setTrainers(prev => [...prev, payload.new as Trainer]);
+        } else if (payload.eventType === 'UPDATE') {
+          setTrainers(prev => prev.map(t => t.id === payload.new.id ? payload.new as Trainer : t));
+        } else if (payload.eventType === 'DELETE') {
+          setTrainers(prev => prev.filter(t => t.id !== payload.old.id));
+        }
+      })
+      .subscribe();
+
+    const stateSub = supabase.channel('public:app_state')
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'app_state', filter: 'id=eq.current' }, (payload) => {
+        if (payload.new.schedule) setSchedule(payload.new.schedule);
+        if (payload.new.warnings) setWarnings(payload.new.warnings);
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(studentsSub);
+      supabase.removeChannel(trainersSub);
+      supabase.removeChannel(stateSub);
+    };
   }, []);
 
   const handleAddStudent = async (student: Student) => {
     try {
-      await fetch('/api/students', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(student)
-      });
+      const { error } = await supabase.from('students').upsert(student);
+      if (error) throw error;
       
       if (editingStudent) {
-        setStudents(students.map(s => s.id === student.id ? student : s));
         setEditingStudent(null);
         setActiveTab('students');
       } else {
-        setStudents([...students, student]);
-        alert('Đăng ký thành công!');
+        alert('Đăng ký thành công! Dữ liệu đã được lưu.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to save student', err);
-      alert('Có lỗi xảy ra khi lưu dữ liệu!');
+      alert(`Lưu dữ liệu thất bại: ${err.message || 'Không thể kết nối tới máy chủ. Vui lòng kiểm tra lại mạng.'}`);
     }
   };
 
@@ -62,24 +106,20 @@ export default function App() {
 
   const handleDeleteStudent = async (id: string) => {
     try {
-      await fetch(`/api/students/${id}`, { method: 'DELETE' });
-      setStudents(students.filter(s => s.id !== id));
+      const { error } = await supabase.from('students').delete().eq('id', id);
+      if (error) throw error;
       
-      // Also remove from schedule
+      // Update schedule state
       const newSchedule = { ...schedule };
       Object.keys(newSchedule).forEach(slot => {
         newSchedule[slot] = newSchedule[slot].filter(e => e.studentId !== id);
       });
-      setSchedule(newSchedule);
-      
       const newWarnings = warnings.filter(w => w.studentId !== id);
-      setWarnings(newWarnings);
       
-      await fetch('/api/schedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ schedule: newSchedule, warnings: newWarnings })
-      });
+      await supabase.from('app_state').update({
+        schedule: newSchedule,
+        warnings: newWarnings
+      }).eq('id', 'current');
     } catch (err) {
       console.error('Failed to delete student', err);
     }
@@ -87,13 +127,9 @@ export default function App() {
 
   const handleAddTrainer = async (name: string) => {
     try {
-      const newTrainer = { id: Date.now().toString(), name };
-      await fetch('/api/trainers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newTrainer)
-      });
-      setTrainers([...trainers, newTrainer]);
+      const id = Date.now().toString();
+      const { error } = await supabase.from('trainers').insert({ id, name });
+      if (error) throw error;
     } catch (err) {
       console.error('Failed to add trainer', err);
     }
@@ -101,21 +137,18 @@ export default function App() {
 
   const handleDeleteTrainer = async (id: string) => {
     try {
-      await fetch(`/api/trainers/${id}`, { method: 'DELETE' });
-      setTrainers(trainers.filter(t => t.id !== id));
+      const { error } = await supabase.from('trainers').delete().eq('id', id);
+      if (error) throw error;
       
-      // Remove from schedule
+      // Update schedule state
       const newSchedule = { ...schedule };
       Object.keys(newSchedule).forEach(slot => {
         newSchedule[slot] = newSchedule[slot].filter(e => e.trainerId !== id);
       });
-      setSchedule(newSchedule);
       
-      await fetch('/api/schedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ schedule: newSchedule, warnings })
-      });
+      await supabase.from('app_state').update({
+        schedule: newSchedule
+      }).eq('id', 'current');
     } catch (err) {
       console.error('Failed to delete trainer', err);
     }
@@ -123,25 +156,15 @@ export default function App() {
 
   const handleRunAlgorithm = async () => {
     try {
-      // Refresh data first to make sure we have the latest students
-      const res = await fetch('/api/data');
-      const data = await res.json();
-      const latestStudents = data.students || [];
-      const latestTrainers = data.trainers || [];
+      const { schedule: newSchedule, warnings: newWarnings } = generateSchedule(students, trainers);
       
-      setStudents(latestStudents);
-      setTrainers(latestTrainers);
-
-      const { schedule: newSchedule, warnings: newWarnings } = generateSchedule(latestStudents, latestTrainers);
+      const { error } = await supabase.from('app_state').update({
+        schedule: newSchedule,
+        warnings: newWarnings
+      }).eq('id', 'current');
       
-      await fetch('/api/schedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ schedule: newSchedule, warnings: newWarnings })
-      });
+      if (error) throw error;
       
-      setSchedule(newSchedule);
-      setWarnings(newWarnings);
       setActiveTab('dashboard');
     } catch (err) {
       console.error('Failed to run algorithm', err);
@@ -152,13 +175,12 @@ export default function App() {
   const handleResetSchedule = async () => {
     if (window.confirm('Bạn có chắc muốn xóa kết quả xếp lịch hiện tại? Danh sách học viên và PT vẫn được giữ nguyên.')) {
       try {
-        await fetch('/api/schedule', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ schedule: {}, warnings: [] })
-        });
-        setSchedule({});
-        setWarnings([]);
+        const { error } = await supabase.from('app_state').update({
+          schedule: {},
+          warnings: []
+        }).eq('id', 'current');
+        
+        if (error) throw error;
       } catch (err) {
         console.error('Failed to reset schedule', err);
       }
@@ -168,11 +190,14 @@ export default function App() {
   const handleClearAll = async () => {
     if (window.confirm('CẢNH BÁO: Bạn sẽ xóa TOÀN BỘ dữ liệu học viên, PT và lịch. Không thể hoàn tác!')) {
       try {
-        await fetch('/api/clear', { method: 'POST' });
-        setStudents([]);
-        setTrainers([]);
-        setSchedule({});
-        setWarnings([]);
+        // Supabase doesn't have a direct batch equivalent for multiple tables in the JS client easily,
+        // so we do them sequentially or in parallel promises.
+        await Promise.all([
+          supabase.from('students').delete().neq('id', '0'), // Delete all
+          supabase.from('trainers').delete().neq('id', '0'), // Delete all
+          supabase.from('app_state').update({ schedule: {}, warnings: [] }).eq('id', 'current')
+        ]);
+        
         setActiveTab('register');
       } catch (err) {
         console.error('Failed to clear all', err);
@@ -185,7 +210,7 @@ export default function App() {
       <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
         <div className="text-pink-500 flex flex-col items-center gap-4">
           <Activity size={48} className="animate-pulse" />
-          <p className="font-bold tracking-widest uppercase">Đang tải dữ liệu...</p>
+          <p className="font-bold tracking-widest uppercase">Đang kết nối Supabase...</p>
         </div>
       </div>
     );
@@ -215,6 +240,23 @@ export default function App() {
             {/* Mobile action buttons (Reset/Clear) */}
             <div className="flex md:hidden items-center gap-2">
               <button
+                onClick={async () => {
+                  try {
+                    alert("Đang kiểm tra kết nối Supabase...");
+                    const { error } = await supabase.from('app_state').select('id').limit(1);
+                    if (error) throw error;
+                    alert("✅ Kết nối Supabase THÀNH CÔNG!");
+                  } catch (err: any) {
+                    console.error("Test connection failed:", err);
+                    alert(`❌ Lỗi kết nối Supabase: ${err.message}`);
+                  }
+                }}
+                className="flex items-center justify-center w-10 h-10 bg-blue-900/50 hover:bg-blue-800/50 text-blue-400 rounded-full font-bold transition-all active:scale-95 border border-blue-800/50"
+                title="Kiểm tra kết nối Supabase"
+              >
+                <Activity size={18} />
+              </button>
+              <button
                 onClick={handleResetSchedule}
                 disabled={Object.keys(schedule).length === 0}
                 className="flex items-center justify-center w-10 h-10 bg-zinc-800 hover:bg-zinc-700 disabled:bg-zinc-900 disabled:text-zinc-600 text-zinc-300 rounded-full font-bold transition-all active:scale-95"
@@ -236,6 +278,32 @@ export default function App() {
           <div className="flex w-full md:w-auto items-center justify-between md:justify-end gap-2">
             {/* Desktop action buttons (Reset/Clear) */}
             <div className="hidden md:flex gap-2">
+              <button
+                onClick={async () => {
+                  try {
+                    alert("Đang kiểm tra kết nối Supabase... Vui lòng đợi.");
+                    
+                    const { error } = await supabase.from('app_state').select('id').limit(1);
+                    if (error) throw error;
+                    
+                    alert("✅ Kết nối Supabase THÀNH CÔNG!\n\nBạn có thể tải lại trang và thử thêm học viên.");
+                  } catch (err: any) {
+                    console.error("Test connection failed:", err);
+                    
+                    let errorMessage = err.message;
+                    if (err.code) {
+                      errorMessage = `[${err.code}] ${err.message}`;
+                    }
+                    
+                    alert(`❌ Lỗi kết nối Supabase:\n\n${errorMessage}\n\nCách khắc phục:\n1. Kiểm tra lại API Key và URL.\n2. Đảm bảo đã chạy mã SQL tạo bảng.`);
+                  }
+                }}
+                className="flex items-center gap-2 bg-blue-900/50 hover:bg-blue-800/50 text-blue-400 px-4 py-2.5 rounded-full font-bold transition-all active:scale-95 text-sm border border-blue-800/50"
+                title="Kiểm tra kết nối Supabase"
+              >
+                <Activity size={18} />
+                <span>Test Supabase</span>
+              </button>
               <button
                 onClick={handleResetSchedule}
                 disabled={Object.keys(schedule).length === 0}
